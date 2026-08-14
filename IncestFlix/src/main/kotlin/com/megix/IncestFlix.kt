@@ -52,7 +52,7 @@ class IncestFlix : MainAPI() {
         )
     }
 
-    private fun parseVideoElement(element: Element, document: Document): SearchResponse? {
+    private suspend fun parseVideoElement(element: Element, document: Document): SearchResponse? {
         // Extract URL - multiple fallbacks
         val url = element.attr("href").takeIf { it.isNotEmpty() }?.let { normalizeUrl(it) }
             ?: element.selectFirst("a[href]")?.attr("href")?.let { normalizeUrl(it) }
@@ -72,20 +72,19 @@ class IncestFlix : MainAPI() {
         if (title.isBlank()) return null
 
         // Extract poster - multiple fallbacks
-        val poster = getPosterUrl(element, document, url)
+        val poster = getPosterUrl(element, url)
 
         return newMovieSearchResponse(title, url, TvType.NSFW) {
             this.posterUrl = poster
             if (poster != null) {
                 this.posterHeaders = mapOf(
-                    "User-Agent" to ua,
-                    "Referer" to mainUrl
+                    "User-Agent" to ua
                 )
             }
         }
     }
 
-    private fun getPosterUrl(element: Element, document: Document, videoUrl: String): String? {
+    private suspend fun getPosterUrl(element: Element, videoUrl: String): String? {
         // Try 1: img tag with src/data-src
         val imgSrc = element.selectFirst("img")?.let { img ->
             img.attr("src").takeIf { it.isNotEmpty() }
@@ -181,8 +180,7 @@ class IncestFlix : MainAPI() {
             this.posterUrl = normalizedPoster
             if (normalizedPoster != null) {
                 this.posterHeaders = mapOf(
-                    "User-Agent" to ua,
-                    "Referer" to mainUrl
+                    "User-Agent" to ua
                 )
             }
             this.plot = description
@@ -212,7 +210,7 @@ class IncestFlix : MainAPI() {
                         source = name,
                         name = name,
                         url = normalized,
-                        referer = data
+                        type = ExtractorLinkType.VIDEO
                     )
                 )
                 foundLinks = true
@@ -228,7 +226,7 @@ class IncestFlix : MainAPI() {
                         source = name,
                         name = name,
                         url = normalized,
-                        referer = data
+                        type = ExtractorLinkType.VIDEO
                     )
                 )
                 foundLinks = true
@@ -253,7 +251,7 @@ class IncestFlix : MainAPI() {
                                     source = name,
                                     name = name,
                                     url = normalizedVideo,
-                                    referer = normalized
+                                    type = ExtractorLinkType.VIDEO
                                 )
                             )
                             foundLinks = true
@@ -277,7 +275,7 @@ class IncestFlix : MainAPI() {
                             source = name,
                             name = name,
                             url = url,
-                            referer = data
+                            type = ExtractorLinkType.VIDEO
                         )
                     )
                     foundLinks = true
@@ -293,8 +291,8 @@ class IncestFlix : MainAPI() {
                         source = name,
                         name = "$name (HLS)",
                         url = url,
-                        referer = data,
-                        isM3u8 = true
+                        isM3u8 = true,
+                        type = ExtractorLinkType.M3U8
                     )
                 )
                 foundLinks = true
