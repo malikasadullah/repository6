@@ -14,277 +14,178 @@ class IncestFlix : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.NSFW)
     override val vpnStatus = VPNStatus.MightBeNeeded
-    private val ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+    private val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-    // Static homepage sections for specific tags requested
     override val mainPage = mainPageOf(
-        "$mainUrl/tag/Reluctant/" to "Reluctant",
-        "$mainUrl/tag/BS/" to "BS Brother, Sister",
-        "$mainUrl/tag/MS/" to "MS Mother, Son",
-        "$mainUrl/tag/FD/" to "FD Father, Daughter",
-        "$mainUrl/tag/MD/" to "MD Mother, Daughter",
-        "$mainUrl/random" to "Random",
+        "$mainUrl/" to "Home",
+        "$mainUrl/search?q=popular" to "Popular",
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val base = if (request.data.endsWith("/")) request.data else request.data + "/"
-        val url = if (page <= 1) base else base + "page/$page/"
-        val res = app.get(url, headers = mapOf("User-Agent" to ua), referer = mainUrl, allowRedirects = true)
+        val url = if (page <= 1) request.data else request.data + if (request.data.contains("?")) "&page=$page" else "?page=$page"
+        val res = app.get(url, headers = mapOf("User-Agent" to ua))
         val document = res.document
-        val pageOrigin = originOf(res.url)
-
-        // Special-case random: resolve to the resulting watch page and show it as a single item
-        if (request.data.endsWith("/random")) {
-            val finalWatch = document.selectFirst("meta[property=og:url]")?.attr("content")
-                ?: document.selectFirst("a[href*=/watch/]")?.attr("abs:href")
-                ?: res.url
-            if (!finalWatch.isNullOrBlank()) {
-                val wdoc = app.get(finalWatch, headers = mapOf("User-Agent" to ua), referer = mainUrl).document
-                val wtitle = wdoc.selectFirst("meta[property=og:title]")?.attr("content") ?: wdoc.title()
-                val wposter = wdoc.selectFirst("meta[property=og:image]")?.attr("content")?.let { normalizeUrl(it) }
-                val one = newMovieSearchResponse(wtitle.ifBlank { finalWatch }, finalWatch, TvType.NSFW) {
-                    this.posterUrl = wposter
-                    this.posterHeaders = mapOf(
-                        Pair("referer", "$mainUrl/"),
-                        Pair("User-Agent", ua)
-                    )
-                }
-                return newHomePageResponse(
-                    list = HomePageList(
-                        name = request.name,
-                        list = listOf(one),
-                        isHorizontalImages = true
-                    ),
-                    hasNext = true
-                )
+        
+        val videos = mutableListOf<SearchResponse>()
+        
+        // Try multiple selectors for video items
+        val videoElements = document.select(
+            "div.video-item, article.video, div.post, div.entry, div.content-item, a[href*=watch], a[href*=view]"
+        ).take(30)
+        
+        videoElements.forEach { element ->
+            try {
+                val video = parseVideoElement(element, document) ?: return@forEach
+                videos.add(video)
+            } catch (e: Exception) {
+                // Skip malformed entries
             }
         }
-
-        // Tag pages sometimes use different paths (e.g. /video/..). Cover both.
-        val anchors = document.select("a[href^=/watch], a[href*=/watch/], a[href*=/video/]")
-        val built = anchors.mapIndexedNotNull { idx, a ->
-            val href = a.attr("abs:href").ifBlank { normalizeUrl(a.attr("href")) }
-            if (href.isBlank()) {
-                null
-            } else {
-                val rawTitle = a.attr("title").ifBlank { a.ownText().ifBlank { a.text() } }.trim()
-                val title = if (rawTitle.isNotBlank()) rawTitle else href.substringAfterLast('/').replace('-', ' ').trim().ifBlank { href }
-
-            // Infer poster locally: prefer a larger card root if present
-            val card = (a.parents().firstOrNull { parent ->
-                val cls = parent.className()
-                cls.contains("video-item") || cls.contains("post") || cls.contains("thumb") ||
-                cls.contains("item") || parent.tagName().equals("article", true)
-            } ?: a.parent()) ?: a
-            val posterCandidates = mutableListOf<String>()
-            // overlays / background-image styles (restrict to inside card only)
-            card.select("div.video-overlay-click").forEach { e -> posterCandidates.add(e.attr("style")) }
-            card.select("[style*=background-image]").forEach { posterCandidates.add(it.attr("style")) }
-            // explicit attributes
-            listOf("src", "data-src", "data-lazy-src", "data-original", "data-bg", "data-thumb", "data-thumbnail").forEach { attr ->
-                card.select("img[$attr], [${attr}], source[$attr]").firstOrNull()?.let { el ->
-                    val v = el.attr("abs:$attr").ifBlank { el.attr(attr) }
-                    if (v.isNotBlank()) posterCandidates.add(v)
-                }
-            }
-            // covers pattern from closest surfaces (any host): anchor -> card -> siblings
-            runCatching {
-                val coversRegex = Regex(
-                    "((?:https?:)?//[^'\"\\s)]+)?/covers/[^'\"\\s)]+\\.(?:png|jpe?g|webp)",
-                    RegexOption.IGNORE_CASE
-                )
-                // 1) anchor markup
-                coversRegex.findAll(a.outerHtml()).firstOrNull()?.let { posterCandidates.add(resolveCoversUrl(it.value, pageOrigin)) }
-                // 2) inside the card subtree
-                if (posterCandidates.isEmpty()) {
-                    coversRegex.findAll(card.outerHtml()).firstOrNull()?.let { posterCandidates.add(resolveCoversUrl(it.value, pageOrigin)) }
-                }
-                // 3) direct siblings only
-                if (posterCandidates.isEmpty()) {
-                    val sib = card.siblingElements().joinToString("\n") { it.outerHtml() }
-                    coversRegex.findAll(sib).firstOrNull()?.let { posterCandidates.add(resolveCoversUrl(it.value, pageOrigin)) }
-                }
-            }
-            // srcset handling (pick first url)
-            card.select("img[srcset], source[srcset]").firstOrNull()?.attr("srcset")?.let { ss ->
-                val first = ss.split(',').map { it.trim().substringBefore(' ') }.firstOrNull()
-                if (!first.isNullOrBlank()) posterCandidates.add(first)
-            }
-
-            // Normalize all candidates to absolute URLs for reliable selection
-            val normalized = posterCandidates.mapNotNull { raw ->
-                val r = raw.trim()
-                val fromStyle = extractBgUrl(r)
-                val candidate = when {
-                    r.contains("/covers/", true) -> resolveCoversUrl(r, pageOrigin)
-                    !fromStyle.isNullOrBlank() -> normalizeUrl(fromStyle)
-                    else -> normalizeUrl(r)
-                }
-                candidate.takeIf { it.startsWith("http") }
-            }
-            val poster = normalized.firstOrNull { it.contains("/covers/", true) } ?: normalized.firstOrNull()
-            val norm = poster
-                val item = newMovieSearchResponse(title, href, TvType.NSFW) {
-                    this.posterUrl = norm
-                    this.posterHeaders = mapOf(
-                        Pair("referer", "$mainUrl/"),
-                        Pair("User-Agent", ua)
-                    )
-                }
-                if (item.posterUrl.isNullOrBlank() && idx < 8) {
-                    runCatching {
-                        val wdoc = app.get(
-                            href,
-                            headers = mapOf("User-Agent" to ua),
-                            referer = mainUrl,
-                            allowRedirects = true,
-                            timeout = 2000
-                        ).document
-                        val og = wdoc.selectFirst("meta[property=og:image]")?.attr("content")
-                        if (!og.isNullOrBlank()) {
-                            val n = normalizeUrl(og)
-                            item.posterUrl = n
-                            item.posterHeaders = mapOf(
-                                Pair("referer", "$mainUrl/"),
-                                Pair("User-Agent", ua)
-                            )
-                        }
-                    }
-                }
-                item
-            }
-        }
-            .distinctBy { it.url }
-            .take(30)
-
+        
         return newHomePageResponse(
             list = HomePageList(
                 name = request.name,
-                list = built,
+                list = videos,
                 isHorizontalImages = true
             ),
-            hasNext = true
+            hasNext = videos.size >= 20
         )
     }
 
-    private fun Element.toSearchResultWithPoster(): SearchResponse? {
-        val href = this.attr("abs:href").ifBlank {
-            val rel = this.attr("href").ifBlank { return null }
-            normalizeUrl(rel)
-        }
-        val rawTitle = this.attr("title").ifBlank {
-            this.ownText().ifBlank { this.text() }
-        }.trim()
-        val title = if (rawTitle.isNotBlank()) rawTitle else href.substringAfterLast('/').replace('-', ' ').trim().ifBlank { href }
+    private fun parseVideoElement(element: Element, document: Document): SearchResponse? {
+        // Extract URL - multiple fallbacks
+        val url = element.attr("href").takeIf { it.isNotEmpty() }?.let { normalizeUrl(it) }
+            ?: element.selectFirst("a[href]")?.attr("href")?.let { normalizeUrl(it) }
+            ?: element.attr("data-url")?.let { normalizeUrl(it) }
+            ?: return null
 
-        // Try to infer poster from nearby elements (align with homepage card detection)
-        val card = (this.parents().firstOrNull { parent ->
-            val cls = parent.className()
-            cls.contains("video-item") || cls.contains("post") || cls.contains("thumb") ||
-            cls.contains("item") || parent.tagName().equals("article", true)
-        } ?: this.parent()) ?: this
-        val posterCandidates = mutableListOf<String>()
-        // Compute current page origin once for URL resolution
-        val origin = originOf(this.baseUri())
-        // 1) Prefer anything directly inside the anchor subtree (strict)
-        listOf("src", "data-src", "data-lazy-src", "data-original", "data-bg", "data-thumb", "data-thumbnail").forEach { attr ->
-            this.select("img[$attr], source[$attr]").firstOrNull()?.let { el ->
-                val v = el.attr("abs:$attr").ifBlank { el.attr(attr) }
-                if (v.isNotBlank()) posterCandidates.add(v)
-            }
-        }
-        runCatching {
-            val coversRegex = Regex(
-                "((?:https?:)?//[^'\"\\s)]+)?/covers/[^'\"\\s)]+\\.(?:png|jpe?g|webp)",
-                RegexOption.IGNORE_CASE
-            )
-            coversRegex.findAll(this.outerHtml()).firstOrNull()?.let { posterCandidates.add(resolveCoversUrl(it.value, origin)) }
-        }
-        // 2) If still empty, use card-local styles and attributes (no parents/siblings)
-        if (posterCandidates.isEmpty()) {
-            card.select("div.video-overlay-click").forEach { e -> posterCandidates.add(e.attr("style")) }
-            card.select("[style*=background-image]").forEach { posterCandidates.add(it.attr("style")) }
-            listOf("src", "data-src", "data-lazy-src", "data-original", "data-bg", "data-thumb", "data-thumbnail").forEach { attr ->
-                card.select("img[$attr], source[$attr]").firstOrNull()?.let { el ->
-                    val v = el.attr("abs:$attr").ifBlank { el.attr(attr) }
-                    if (v.isNotBlank()) posterCandidates.add(v)
-                }
-            }
-            runCatching {
-                val coversRegex = Regex(
-                    "((?:https?:)?//[^'\"\\s)]+)?/covers/[^'\"\\s)]+\\.(?:png|jpe?g|webp)",
-                    RegexOption.IGNORE_CASE
+        if (url.isBlank() || !isValidUrl(url)) return null
+
+        // Extract title - multiple fallbacks
+        val title = element.attr("title").takeIf { it.isNotEmpty() }
+            ?: element.selectFirst("h2, h3, .title, [class*=title]")?.text()
+            ?: element.selectFirst("a")?.text()
+            ?: element.attr("data-name")
+            ?: url.substringAfterLast("/").replace(Regex("[^a-zA-Z0-9 ]"), " ").trim()
+            ?: return null
+
+        if (title.isBlank()) return null
+
+        // Extract poster - multiple fallbacks
+        val poster = getPosterUrl(element, document, url)
+
+        return newMovieSearchResponse(title, url, TvType.NSFW) {
+            this.posterUrl = poster
+            if (poster != null) {
+                this.posterHeaders = mapOf(
+                    "User-Agent" to ua,
+                    "Referer" to mainUrl
                 )
-                coversRegex.findAll(card.outerHtml()).firstOrNull()?.let { posterCandidates.add(resolveCoversUrl(it.value, origin)) }
             }
         }
-        // srcset handling (pick first url)
-        card.select("img[srcset], source[srcset]").firstOrNull()?.attr("srcset")?.let { ss ->
-            val first = ss.split(',').map { it.trim().substringBefore(' ') }.firstOrNull()
-            if (!first.isNullOrBlank()) posterCandidates.add(first)
+    }
+
+    private fun getPosterUrl(element: Element, document: Document, videoUrl: String): String? {
+        // Try 1: img tag with src/data-src
+        val imgSrc = element.selectFirst("img")?.let { img ->
+            img.attr("src").takeIf { it.isNotEmpty() }
+                ?: img.attr("data-src").takeIf { it.isNotEmpty() }
+                ?: img.attr("data-lazy-src").takeIf { it.isNotEmpty() }
+        }?.let { normalizeUrl(it) }
+
+        if (imgSrc != null && imgSrc.startsWith("http")) return imgSrc
+
+        // Try 2: background-image style
+        val bgImage = element.attr("style").let { style ->
+            Regex("""background-image\s*:\s*url\(['"]?([^'")]+)['"]?\)""").find(style)?.groupValues?.get(1)
+        }?.let { normalizeUrl(it) }
+
+        if (bgImage != null && bgImage.startsWith("http")) return bgImage
+
+        // Try 3: data attributes
+        val dataPoster = element.attr("data-poster")?.takeIf { it.isNotEmpty() }
+            ?: element.attr("data-thumbnail")?.takeIf { it.isNotEmpty() }
+            ?: element.attr("data-image")?.takeIf { it.isNotEmpty() }
+
+        if (dataPoster != null) {
+            val normalized = normalizeUrl(dataPoster)
+            if (normalized.startsWith("http")) return normalized
         }
 
-        // Normalize all candidates to absolute URLs for reliable selection
-        val normalized = posterCandidates.mapNotNull { raw ->
-            val r = raw.trim()
-            val fromStyle = extractBgUrl(r)
-            val candidate = when {
-                r.contains("/covers/", true) -> resolveCoversUrl(r, origin)
-                !fromStyle.isNullOrBlank() -> normalizeUrl(fromStyle)
-                else -> normalizeUrl(r)
-            }
-            candidate.takeIf { it.startsWith("http") }
+        // Try 4: og:image from video page (risky but last resort)
+        return try {
+            if (videoUrl.isNotEmpty()) {
+                val videoDoc = app.get(videoUrl, headers = mapOf("User-Agent" to ua), timeout = 5000).document
+                videoDoc.selectFirst("meta[property=og:image]")?.attr("content")?.let { normalizeUrl(it) }
+                    ?: videoDoc.selectFirst("meta[name=twitter:image]")?.attr("content")?.let { normalizeUrl(it) }
+                    ?: videoDoc.selectFirst("img[class*=poster], img[class*=thumb]")?.attr("src")?.let { normalizeUrl(it) }
+            } else null
+        } catch (e: Exception) {
+            null
         }
-        val poster = normalized.firstOrNull { it.contains("/covers/", true) } ?: normalized.firstOrNull()
-
-        val item = newMovieSearchResponse(title, href, TvType.NSFW) {
-            val norm = poster
-            this.posterUrl = norm
-            this.posterHeaders = mapOf(
-                Pair("referer", "$mainUrl/"),
-                Pair("User-Agent", ua)
-            )
-        }
-        return item
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        // Tag-based search: /tag/{slug}/page/{i}
-        val slug = query.trim().replace(Regex("\\s+"), "-")
-        val out = mutableListOf<SearchResponse>()
-        for (i in 1..10) {
-            val url = if (i == 1) "$mainUrl/tag/$slug/" else "$mainUrl/tag/$slug/page/$i/"
-            val doc = app.get(url, headers = mapOf("User-Agent" to ua), referer = mainUrl).document
-            val results = doc.select("a[href^=/watch], a[href*=/watch/], a[href*=/video/]")
-                .mapNotNull { it.toSearchResultWithPoster() }
-            out.addAll(results)
-            if (results.isEmpty()) break
-        }
-        return out
+        val url = "$mainUrl/search?q=${query.trim()}"
+        val res = app.get(url, headers = mapOf("User-Agent" to ua))
+        val document = res.document
+
+        return document.select(
+            "div.video-item, article.video, div.post, div.entry, div.content-item, a[href*=watch]"
+        ).mapNotNull { element ->
+            try {
+                parseVideoElement(element, document)
+            } catch (e: Exception) {
+                null
+            }
+        }.distinctBy { it.url }.take(20)
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val document = app.get(url, headers = mapOf("User-Agent" to ua), referer = mainUrl).document
-        val title = document.selectFirst("meta[property=og:title]")?.attr("content")
-            ?: document.selectFirst("title")?.text()
-            ?: name
-        val poster = document.selectFirst("meta[property=og:image]")?.attr("content")?.let { normalizeUrl(it) }
+        val doc = app.get(url, headers = mapOf("User-Agent" to ua)).document
 
-        // Collect related items with targeted og:image fallback for missing posters (fast, capped)
-        val recAnchors = document.select("a[href*=/watch/]")
-        val recommendations = recAnchors.mapNotNull { a ->
-            a.toSearchResultWithPoster()
-        }
-            .filter { it.url != url }
-            .distinctBy { it.url }
-            .take(20)
+        // Extract title - multiple fallbacks
+        val title = doc.selectFirst("meta[property=og:title]")?.attr("content")
+            ?: doc.selectFirst("meta[name=title]")?.attr("content")
+            ?: doc.selectFirst("h1, .title, [class*=title]")?.text()
+            ?: doc.title()
+            ?: "Video"
+
+        // Extract poster - multiple fallbacks
+        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
+            ?: doc.selectFirst("meta[name=twitter:image]")?.attr("content")
+            ?: doc.selectFirst("img.poster, img[class*=poster], img[class*=thumb]")?.attr("src")
+            ?: doc.selectFirst("img")?.attr("src")
+            ?: null
+
+        val normalizedPoster = poster?.let { normalizeUrl(it) }
+
+        // Extract description
+        val description = doc.selectFirst("meta[property=og:description]")?.attr("content")
+            ?: doc.selectFirst("meta[name=description]")?.attr("content")
+            ?: doc.selectFirst("p, .description, [class*=desc]")?.text()
+            ?: ""
+
+        // Get recommendations
+        val recommendations = doc.select(
+            "div.related-item, div.similar, a[href*=watch], a[href*=view]"
+        ).mapNotNull { element ->
+            try {
+                parseVideoElement(element, doc)
+            } catch (e: Exception) {
+                null
+            }
+        }.filter { it.url != url }.distinctBy { it.url }.take(15)
 
         return newMovieLoadResponse(title, url, TvType.NSFW, url) {
-            this.posterUrl = poster
-            this.posterHeaders = mapOf(
-                Pair("referer", mainUrl),
-                Pair("User-Agent", ua)
-            )
+            this.posterUrl = normalizedPoster
+            if (normalizedPoster != null) {
+                this.posterHeaders = mapOf(
+                    "User-Agent" to ua,
+                    "Referer" to mainUrl
+                )
+            }
+            this.plot = description
             this.recommendations = recommendations
         }
     }
@@ -295,110 +196,133 @@ class IncestFlix : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val doc = app.get(data, headers = mapOf("User-Agent" to ua), referer = mainUrl).document
+        val doc = app.get(data, headers = mapOf("User-Agent" to ua)).document
+        var foundLinks = false
 
-        // Try common patterns: direct <video><source>, iframes to hosts, or anchors to files
-        val candidates = mutableListOf<String>()
+        // Method 1: Direct video/source tags
+        doc.select("video source[src], video source[data-src]").forEach { source ->
+            val src = source.attr("src").takeIf { it.isNotEmpty() }
+                ?: source.attr("data-src").takeIf { it.isNotEmpty() }
+                ?: return@forEach
 
-        // PRIORITY: dedicated player element
-        doc.selectFirst("video#incflix-player")?.let { v ->
-            val poster = v.attr("poster").takeIf { it.isNotBlank() }?.let { normalizeUrl(it) }
-            // Possible layouts:
-            // 1) <video id=incflix-player><source src=...></video>
-            // 2) <video id=incflix-player ... /> <source src=...></video>
-            // 3) <video id=incflix-player src=...>
-            val srcAttr = v.attr("src").takeIf { it.isNotBlank() }?.let { normalizeUrl(it) }
-            val childSource = v.selectFirst("source[src]")?.attr("src")?.let { normalizeUrl(it) }
-            val siblingSource = v.nextElementSibling()?.takeIf { it.tagName().equals("source", true) }?.attr("src")?.let { normalizeUrl(it) }
-            val genSibling = doc.selectFirst("video#incflix-player ~ source[src]")?.attr("src")?.let { normalizeUrl(it) }
-
-            listOf(srcAttr, childSource, siblingSource, genSibling).filterNotNull().forEach { s ->
-                if (s.isNotBlank()) candidates.add(s)
-            }
-            // poster handled in load() via og:image
-        }
-
-        // video > source[src]
-        candidates.addAll(doc.select("video source[src]").map { normalizeUrl(it.attr("src")) })
-        // video[src]
-        candidates.addAll(doc.select("video[src]").map { normalizeUrl(it.attr("src")) })
-        // data-src/data-video on video/source
-        candidates.addAll(doc.select("video[data-src], source[data-src]").map { normalizeUrl(it.attr("data-src")) })
-        candidates.addAll(doc.select("video[data-video]").map { normalizeUrl(it.attr("data-video")) })
-        // iframes (rare but keep)
-        candidates.addAll(doc.select("iframe[src]").map { normalizeUrl(it.attr("src")) })
-        // anchors that look like media links
-        candidates.addAll(
-            doc.select("a[href]")
-                .map { normalizeUrl(it.attr("href")) }
-                .filter { it.contains(".m3u8") || it.contains(".mp4") }
-        )
-
-        // As a last resort, global <source src> on page (some templates place it next to a self-closed video)
-        candidates.addAll(doc.select("source[src]").map { normalizeUrl(it.attr("src")) })
-
-        // Parse inline scripts for direct sources
-        runCatching {
-            val scriptText = doc.select("script").joinToString("\n") { it.data() }
-            val m3u8Regex = Regex("https?:\\/\\/[^'\"\\s)]+\\.m3u8")
-            val mp4Regex = Regex("https?:\\/\\/[^'\"\\s)]+\\.mp4")
-            candidates.addAll(m3u8Regex.findAll(scriptText).map { it.value }.toList())
-            candidates.addAll(mp4Regex.findAll(scriptText).map { it.value }.toList())
-        }
-
-        val unique = candidates.filter { it.isNotBlank() }.distinct()
-
-        if (unique.isEmpty()) return false
-
-        unique.forEach { link ->
-            callback.invoke(
-                newExtractorLink(
-                    source = name,
-                    name = name,
-                    url = link
+            val normalized = normalizeUrl(src)
+            if (normalized.isNotEmpty() && isValidMediaUrl(normalized)) {
+                callback.invoke(
+                    newExtractorLink(
+                        source = name,
+                        name = name,
+                        url = normalized,
+                        referer = data
+                    )
                 )
-            )
+                foundLinks = true
+            }
         }
-        return true
+
+        // Method 2: Video tag src attribute
+        doc.selectFirst("video[src]")?.attr("src")?.let { src ->
+            val normalized = normalizeUrl(src)
+            if (normalized.isNotEmpty() && isValidMediaUrl(normalized)) {
+                callback.invoke(
+                    newExtractorLink(
+                        source = name,
+                        name = name,
+                        url = normalized,
+                        referer = data
+                    )
+                )
+                foundLinks = true
+            }
+        }
+
+        // Method 3: Iframe embeds
+        doc.select("iframe[src]").forEach { iframe ->
+            val src = iframe.attr("src").takeIf { it.isNotEmpty() } ?: return@forEach
+            val normalized = normalizeUrl(src)
+            
+            if (normalized.isNotEmpty()) {
+                // Try to extract from iframe
+                try {
+                    val iframeDoc = app.get(normalized, headers = mapOf("User-Agent" to ua), timeout = 3000).document
+                    iframeDoc.select("video source[src], source[src]").forEach { source ->
+                        val videoSrc = source.attr("src")
+                        val normalizedVideo = normalizeUrl(videoSrc)
+                        if (normalizedVideo.isNotEmpty() && isValidMediaUrl(normalizedVideo)) {
+                            callback.invoke(
+                                newExtractorLink(
+                                    source = name,
+                                    name = name,
+                                    url = normalizedVideo,
+                                    referer = normalized
+                                )
+                            )
+                            foundLinks = true
+                        }
+                    }
+                } catch (e: Exception) {
+                    // Skip iframe if it fails
+                }
+            }
+        }
+
+        // Method 4: Parse script tags for direct URLs
+        doc.select("script").forEach { script ->
+            val content = script.data()
+            // Look for .m3u8 or .mp4 URLs
+            Regex("""https?://[^\s"'<>]+\.(?:m3u8|mp4)""").findAll(content).forEach { match ->
+                val url = match.value
+                if (url.isNotEmpty() && isValidMediaUrl(url)) {
+                    callback.invoke(
+                        newExtractorLink(
+                            source = name,
+                            name = name,
+                            url = url,
+                            referer = data
+                        )
+                    )
+                    foundLinks = true
+                }
+            }
+        }
+
+        // Method 5: HLS playlist patterns
+        Regex("""https?://[^\s"'<>]+\.m3u8""").find(doc.toString())?.value?.let { url ->
+            if (isValidMediaUrl(url)) {
+                callback.invoke(
+                    newExtractorLink(
+                        source = name,
+                        name = "$name (HLS)",
+                        url = url,
+                        referer = data,
+                        isM3u8 = true
+                    )
+                )
+                foundLinks = true
+            }
+        }
+
+        return foundLinks
     }
 
-    private fun extractBgUrl(styleOrUrl: String): String? {
-        val style = styleOrUrl.trim()
-        if (style.startsWith("http")) return style
-        val match = Regex("background-image\\s*:\\s*url\\((['\"]?)(.*?)\\1\\)", RegexOption.IGNORE_CASE)
-            .find(style)
-        return match?.groupValues?.getOrNull(2)
+    private fun isValidUrl(url: String): Boolean {
+        return url.startsWith("http://") || url.startsWith("https://") || url.startsWith("/")
+    }
+
+    private fun isValidMediaUrl(url: String): Boolean {
+        return url.contains(".mp4") || url.contains(".m3u8") || url.contains(".webm") || url.contains(".mkv")
     }
 
     private fun normalizeUrl(url: String?): String {
         if (url.isNullOrBlank()) return ""
         return when {
-            url.startsWith("//") -> "https:" + url
+            url.startsWith("//") -> "https:$url"
             url.startsWith("http") -> url
-            else -> fixUrl(url)
-        }
-    }
-
-    private fun originOf(u: String): String {
-        val full = normalizeUrl(u)
-        return try {
-            val uri = java.net.URI(full)
-            val scheme = uri.scheme ?: "https"
-            val host = uri.host ?: return mainUrl
-            "$scheme://$host"
-        } catch (e: Throwable) {
-            mainUrl
-        }
-    }
-
-    private fun resolveCoversUrl(raw: String, origin: String): String {
-        val s = raw.trim()
-        val valOrUrl = extractBgUrl(s) ?: s
-        return when {
-            valOrUrl.startsWith("http") -> valOrUrl
-            valOrUrl.startsWith("//") -> "https:" + valOrUrl
-            valOrUrl.startsWith("/covers/") -> origin + valOrUrl
-            else -> normalizeUrl(valOrUrl)
+            url.startsWith("/") -> mainUrl + url
+            else -> try {
+                fixUrl(url)
+            } catch (e: Exception) {
+                ""
+            }
         }
     }
 }
