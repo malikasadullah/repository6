@@ -1,4 +1,4 @@
-package com.megix
+Package com.megix
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
@@ -6,7 +6,7 @@ import org.jsoup.nodes.Element
 import org.jsoup.nodes.Document
 
 class IncestFlix : MainAPI() {
-    override var mainUrl = "https://www.incestflix.com"
+    override var mainUrl = "https://incestflix.com.co"
     override var name = "IncestFlix"
     override val hasMainPage = true
     override var lang = "en"
