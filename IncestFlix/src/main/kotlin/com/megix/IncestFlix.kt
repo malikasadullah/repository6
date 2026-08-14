@@ -291,7 +291,6 @@ class IncestFlix : MainAPI() {
                         source = name,
                         name = "$name (HLS)",
                         url = url,
-                        isM3u8 = true,
                         type = ExtractorLinkType.M3U8
                     )
                 )
